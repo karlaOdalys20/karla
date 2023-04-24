@@ -1,0 +1,521 @@
+---
+title: "Topic Modelling - Academic research Guayas Riber Basin & comparative basins"
+author: "Gonzalo Villa-Cox"
+date: "13/09/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(bibliometrix)
+library(dplyr)
+library(parallel)
+library(doParallel)
+library(readxl)
+library(purrr)
+library(data.table)
+library(tidyr)
+library(stringr)
+library(tm)
+library(stm)
+library(tictoc)
+library(gtools)
+library(text2vec)
+library(rARPACK)
+library(igraph)
+library(RColorBrewer)
+library(cluster)
+library(Matrix) # Some package might have overriden the t() function
+
+unique.rand.seed <- 29081984
+set.seed(unique.rand.seed)
+
+```
+
+```{r source_process, echo=FALSE}
+
+scopus.src.list <- read_xlsx(path = "X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\final_bib_dbase\\scopus_datasources.xlsx",
+                             sheet = "scopus_source_list")
+
+scopus.src.list$Source_Type <- as.factor(scopus.src.list$Source_Type)
+scopus.src.list <- scopus.src.list %>% filter(Source_Type %in% c("Journal")) %>%
+                                       filter(Active_Status %in% c("Active"))
+
+scopus.ajscc.list <- read_xlsx(path = "X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\final_bib_dbase\\scopus_datasources.xlsx",
+                               sheet = "AJSCC_CodeList")
+
+scopus.src.list[["row.id"]] <- as.numeric(rownames(scopus.src.list))  
+dt_list <- map(strsplit(as.character(scopus.src.list$All_SJCC), ';', fixed=TRUE), as.data.table)
+dt <- as.data.frame( rbindlist(dt_list, use.names = TRUE, fill = TRUE, idcol = "row.id")  ) 
+dt[,"V1"] <- as.numeric(dt[,"V1"])
+colnames(dt)[2] <- "SJCC.Code"
+dt[,"SJCC.Group"] <- floor(dt[,"SJCC.Code"] / 100) * 100
+dt <- dt %>% group_by(row.id) %>% mutate(SJCC.id = row_number()) %>%
+             inner_join(scopus.ajscc.list, by = c("SJCC.Group" = "Code")) 
+colnames(dt)[5] <- "SJCC.Group.Description"
+dt[,"SJCC.id"] <- str_c("SJCC_",dt$SJCC.id)
+
+dt2 <- dt %>% filter(!duplicated(SJCC.Group)) %>%
+              select(row.id,SJCC.Group,SJCC.Group.Description) %>%
+              group_by(row.id) %>% mutate(SJCC.id = row_number())
+dt2[,"SJCC.id"] <- str_c("SJCC_",dt2$SJCC.id)
+
+scopus.src.list <- dt2 %>% pivot_wider(id_cols = row.id, names_from = SJCC.id, values_from = SJCC.Group.Description) %>%              
+                           inner_join(scopus.src.list, by = c("row.id" = "row.id")) %>% 
+                           filter(!duplicated(`Print-ISSN`)) %>%
+                           filter(!is.na(`Print-ISSN`) & Active_Status == "Active")
+
+```
+
+```{r document_loading, echo=FALSE}
+
+# Set up objects for multi-threading
+clus.cores <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(clus.cores)
+
+scopus.bib.batch <- list(batch01=list(basin="Biobio",country="Chile",file="biobio01.bib"),
+                         batch02=list(basin="Biobio",country="Chile",file="biobio02.bib"),
+                         batch03=list(basin="Guayas",country="Ecuador",file="guayas01.bib"),
+                         batch04=list(basin="Guayas",country="Ecuador",file="guayas02.bib"),
+                         batch05=list(basin="Magdalena",country="Colombia",file="magdalena01.bib"),
+                         batch06=list(basin="Magdalena",country="Colombia",file="magdalena02.bib"),
+                         batch07=list(basin="Maule",country="Chile",file="maule01.bib"),
+                         batch08=list(basin="Copiapo",country="Chile",file="copiapo01.bib"),
+                         batch09=list(basin="Maipo",country="Chile",file="maipo01.bib"),
+                         batch10=list(basin="Baker",country="Chile",file="baker01.bib"),
+                         batch11=list(basin="Loa",country="Chile",file="loa01.bib"),
+                         batch12=list(basin="Atrato",country="Colombia",file="atrato01.bib"),
+                         batch13=list(basin="Tumbes",country="Peru",file="tumbes01.bib"),
+                         batch14=list(basin="Piura",country="Peru",file="piura01.bib"),
+                         batch15=list(basin="Balsas",country="Mexico",file="balsas01.bib"),
+                         batch16=list(basin="Santiago",country="Mexico",file="santiago01.bib"),
+                         batch17=list(basin="Gulf of California",country="Mexico",file="california01.bib"),
+                         batch18=list(basin="Gulf of California",country="Mexico",file="california02.bib"),
+                         batch19=list(basin="Culiacan",country="Mexico",file="culiacan01.bib"),
+                         batch20=list(basin="Lerma",country="Mexico",file="lerma01.bib"),
+                         batch21=list(basin="Nazas-Aguanaval",country="Mexico",file="nazas-aguanaval01.bib"),
+                         batch22=list(basin="Grande",country="Mexico",file="grande01.bib"),
+                         batch23=list(basin="Uruguay",country="Uruguay",file="uruguay01.bib"),
+                         batch24=list(basin="Jubones",country="Ecuador",file="jubones01.bib"),
+                         batch25=list(basin="Esmeraldas",country="Ecuador",file="esmeraldas01.bib"),
+                         batch26=list(basin="Paute",country="Ecuador",file="paute01.bib"),
+                         batch27=list(basin="Huallaga",country="Peru",file="huallaga01.bib"),
+                         batch28=list(basin="Rimac",country="Peru",file="rimac01.bib"),
+                         batch29=list(basin="Patia",country="Colombia",file="patia01.bib"),
+                         batch30=list(basin="Colca",country="Peru",file="colca01.bib"),
+                         batch31=list(basin="Chira",country="Peru",file="chira01.bib"),
+                         batch32=list(basin="Mira",country="Colombia",file="mira01.bib"),
+                         batch33=list(basin="Ica",country="Peru",file="ica01.bib"),
+                         batch34=list(basin="Misisipi",country="USA",file="Mississipi1996_1990.bib"),
+                         batch35=list(basin="Misisipi",country="USA",file="Mississipi2008_1997.bib"),
+                         batch36=list(basin="Misisipi",country="USA",file="Mississipi2015_2009.bib"),
+                         batch37=list(basin="Misisipi",country="USA",file="Mississipi2023_2016.bib"),
+                         batch38=list(basin="Parana",country="Brasil",file="Parana2010_1990.bib"),
+                         batch39=list(basin="Parana",country="Brasil",file="Parana2023_2011.bib"),)
+
+# There is an issue with recent Scopus searches with the # of returned columns.
+# Only a subset of fields will be extracted each batch to ensure matching
+# the number of columns across batches
+
+min.scopus.colset <- c("AU","TI","SO","SN","JI","DT","DE","ID","AB","C1",
+                       "RP","CR","TC","PY","DB","DI")
+
+M.scopus <- foreach(batch=scopus.bib.batch, .combine = rbind.data.frame,
+                    .packages = c("bibliometrix")) %dopar% {
+  bib.file <- paste0("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\final_bib_dbase\\",batch$file)
+  M.batch <- as.data.frame(bibliometrix::convert2df(bib.file, dbsource = "scopus", format = "bibtex")) 
+  M.batch <- M.batch[,min.scopus.colset]
+  M.batch <- cbind.data.frame(M.batch,Basin=rep(batch$basin, nrow(M.batch)))
+  M.batch <- cbind.data.frame(M.batch,Country=rep(batch$country, nrow(M.batch)))
+  M.batch
+}
+
+# De-register parallel processing cluster
+stopCluster(clus.cores)
+registerDoSEQ()
+
+M.scopus$DI <- as.factor(trimws(M.scopus$DI)) # DOI code for every paper
+M.scopus$DT <- as.factor(trimws(M.scopus$DT)) # Document Type
+
+M.scopus <- M.scopus %>% filter(DT %in% c("ARTICLE","LETTER","NOTE"))
+M.scopus <- M.scopus %>% filter(!duplicated(DI))
+
+M.paperdb <- as.data.frame(M.scopus %>% inner_join(scopus.src.list, by = c("SN" = "Print-ISSN"))) 
+
+# Arias-Hidalgo: Don't consider "Grande River" or "Gulf of Mexico" and others that go to the Atlantic Ocean
+M.paperdb <- M.paperdb %>% filter(!(Basin %in% c("Gulf of California","Grande", "Uruguay","Huallaga")))
+
+```
+
+## Including Plots
+
+```{r document_preprocessing, echo=FALSE}
+
+# Define a function for getting the pre-processed, stemmed version of a text column
+# to apply to the name of each journal for matching
+
+get.preprocessed.textcol <- function(textcol) {
+  
+  eng.stoplist <- read.csv("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\final_bib_dbase\\custom_stopwords.csv", 
+                           header=TRUE, stringsAsFactors = FALSE)
+  my.corpus <- Corpus(VectorSource(as.vector(textcol))) 
+  my.corpus <- tm_map(my.corpus, content_transformer(removePunctuation))
+  my.corpus <- tm_map(my.corpus, content_transformer(tolower))
+  my.corpus  <- tm_map(my.corpus, content_transformer(removeWords), eng.stoplist$stopword)
+  my.corpus  <- tm_map(my.corpus, content_transformer(stemDocument), language = "english")
+  return (as.array(sapply(my.corpus, identity), 
+                   stringsAsFactors=F))
+}
+
+M.paperdb[["AB_preprocessed"]] <- get.preprocessed.textcol(M.paperdb$AB)
+M.paperdb <- M.paperdb %>% filter(M.paperdb$AB_preprocessed != "NA")
+
+group1.sjcc.list <- c("General Agricultural and Biological Sciences",
+                      "General Biochemistry, Genetics and Molecular Biology")
+M.paperdb[["SJCC.Group1"]] <- M.paperdb[,"SJCC_1"] %in% group1.sjcc.list | M.paperdb[,"SJCC_2"] %in% group1.sjcc.list |
+                              M.paperdb[,"SJCC_3"] %in% group1.sjcc.list | M.paperdb[,"SJCC_4"] %in% group1.sjcc.list |
+                              M.paperdb[,"SJCC_5"] %in% group1.sjcc.list | M.paperdb[,"SJCC_6"] %in% group1.sjcc.list |
+                              M.paperdb[,"SJCC_7"] %in% group1.sjcc.list | M.paperdb[,"SJCC_8"] %in% group1.sjcc.list
+
+group2.sjcc.list <- c("General Business, Management and Accounting","General Computer Science",
+                      "General Economics, Econometrics and Finance","General Mathematics",
+                      "General Decision Sciences","General Social Sciences")
+M.paperdb[["SJCC.Group2"]] <- M.paperdb[,"SJCC_1"] %in% group2.sjcc.list | M.paperdb[,"SJCC_2"] %in% group2.sjcc.list |
+                              M.paperdb[,"SJCC_3"] %in% group2.sjcc.list | M.paperdb[,"SJCC_4"] %in% group2.sjcc.list |
+                              M.paperdb[,"SJCC_5"] %in% group2.sjcc.list | M.paperdb[,"SJCC_6"] %in% group2.sjcc.list |
+                              M.paperdb[,"SJCC_7"] %in% group2.sjcc.list | M.paperdb[,"SJCC_8"] %in% group2.sjcc.list
+
+group3.sjcc.list <- c("General Earth and Planetary Sciences","General Environmental Science",
+                      "General Chemical Engineering","General Chemistry","General Energy",
+                      "General Materials Science","General Physics and Astronomy")
+M.paperdb[["SJCC.Group3"]] <- M.paperdb[,"SJCC_1"] %in% group3.sjcc.list | M.paperdb[,"SJCC_2"] %in% group3.sjcc.list |
+                              M.paperdb[,"SJCC_3"] %in% group3.sjcc.list | M.paperdb[,"SJCC_4"] %in% group3.sjcc.list |
+                              M.paperdb[,"SJCC_5"] %in% group3.sjcc.list | M.paperdb[,"SJCC_6"] %in% group3.sjcc.list |
+                              M.paperdb[,"SJCC_7"] %in% group3.sjcc.list | M.paperdb[,"SJCC_8"] %in% group3.sjcc.list
+
+group4.sjcc.list <- c("General Engineering","Multidisciplinary")
+M.paperdb[["SJCC.Group4"]] <- M.paperdb[,"SJCC_1"] %in% group4.sjcc.list | M.paperdb[,"SJCC_2"] %in% group4.sjcc.list |
+                              M.paperdb[,"SJCC_3"] %in% group4.sjcc.list | M.paperdb[,"SJCC_4"] %in% group4.sjcc.list |
+                              M.paperdb[,"SJCC_5"] %in% group4.sjcc.list | M.paperdb[,"SJCC_6"] %in% group4.sjcc.list |
+                              M.paperdb[,"SJCC_7"] %in% group4.sjcc.list | M.paperdb[,"SJCC_8"] %in% group4.sjcc.list
+
+group5.sjcc.list <- c("General Health Professions","General Medicine","General Neuroscience",
+                      "General Pharmacology, Toxicology and Pharmaceutics","General Veterinary",
+                      "General Psychology","General Arts and Humanities",
+                      "General Immunology and Microbiology")
+M.paperdb[["SJCC.Group5"]] <- M.paperdb[,"SJCC_1"] %in% group5.sjcc.list | M.paperdb[,"SJCC_2"] %in% group5.sjcc.list |
+                              M.paperdb[,"SJCC_3"] %in% group5.sjcc.list | M.paperdb[,"SJCC_4"] %in% group5.sjcc.list |
+                              M.paperdb[,"SJCC_5"] %in% group5.sjcc.list | M.paperdb[,"SJCC_6"] %in% group5.sjcc.list |
+                              M.paperdb[,"SJCC_7"] %in% group5.sjcc.list | M.paperdb[,"SJCC_8"] %in% group5.sjcc.list
+
+M.paperdb[["Basin.Group.A"]] <- M.paperdb[["Basin"]]
+M.paperdb[M.paperdb$Basin %in% c("Baker","Copiapo","Loa","Maule","Maipo") ,"Basin.Group.A"] <- "Others_Chile"
+M.paperdb[M.paperdb$Basin %in% c("Balsas","Culiacan","Santiago","Nazas-Aguanaval") ,"Basin.Group.A"] <- "Others_Mexico"
+M.paperdb[M.paperdb$Basin %in% c("Esmeraldas","Paute","Jubones") ,"Basin.Group.A"] <- "Others_Ecuador"
+M.paperdb[M.paperdb$Basin %in% c("Atrato","Patia","Mira") ,"Basin.Group.A"] <- "Others_Colombia"
+M.paperdb[M.paperdb$Basin %in% c("Tumbes","Rimac","Piura","Ica","Colca","Chira") ,"Basin.Group.A"] <- "AllBasins_Peru"
+
+M.paperdb[["Basin.Group.B"]] <- M.paperdb[["Basin.Group.A"]]
+M.paperdb[M.paperdb$Basin.Group.A %in% c("Others_Chile","Others_Mexico","Others_Ecuador",
+                                         "Others_Colombia","AllBasins_Peru") ,"Basin.Group.B"] <- "All_Others"
+
+M.paperdb[["Basin"]] <- as.factor(M.paperdb[["Basin"]])
+M.paperdb[["Country"]] <- as.factor(M.paperdb[["Country"]])
+M.paperdb[["Basin.Group.A"]] <- as.factor(M.paperdb[["Basin.Group.A"]])
+M.paperdb[["Basin.Group.B"]] <- as.factor(M.paperdb[["Basin.Group.B"]])
+M.paperdb[["SJCC.Group1"]] <- as.factor(M.paperdb[["SJCC.Group1"]])
+M.paperdb[["SJCC.Group2"]] <- as.factor(M.paperdb[["SJCC.Group2"]])
+M.paperdb[["SJCC.Group3"]] <- as.factor(M.paperdb[["SJCC.Group3"]])
+M.paperdb[["SJCC.Group4"]] <- as.factor(M.paperdb[["SJCC.Group4"]])
+M.paperdb[["SJCC.Group5"]] <- as.factor(M.paperdb[["SJCC.Group5"]])
+
+table(M.paperdb$Basin)
+table(M.paperdb$Country)
+table(M.paperdb$Basin.Group.A)
+table(M.paperdb$Basin.Group.B)
+table(M.paperdb$SJCC.Group1)
+table(M.paperdb$SJCC.Group2)
+table(M.paperdb$SJCC.Group3)
+table(M.paperdb$SJCC.Group4)
+table(M.paperdb$SJCC.Group5)
+
+```
+
+```{r stm_estimation, echo=FALSE}
+
+pdf("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\stm.estimation.pdf")
+
+procdocs.AB <- textProcessor(M.paperdb$AB_preprocessed, 
+                             metadata = M.paperdb[,c("DI","PY","TC",
+                                                     "SJCC.Group1","SJCC.Group2",
+                                                     "SJCC.Group3","SJCC.Group4",
+                                                     "SJCC.Group5","Country",
+                                                     "Basin","Basin.Group.B")])
+plotRemoved(procdocs.AB$documents, lower.thresh = seq(1,300, by=10))
+out.docs <- prepDocuments(procdocs.AB$documents, procdocs.AB$vocab, 
+                          procdocs.AB$meta, lower.thresh = 25)
+
+# Set up objects for multi-threading
+clus.cores <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(clus.cores)
+
+# Prevalence model specification
+prevalence.modelspec <- ~ PY + splines::bs(TC) + 
+                          SJCC.Group1 + SJCC.Group2 + 
+                          SJCC.Group3 + SJCC.Group4 +
+                          SJCC.Group5 + Basin.Group.B
+
+tictoc::tic()
+
+holdout.perc <- 0.3
+  
+K.range <- c(seq(5,30,by=5),seq(40,100, by=10))
+search.stm.res <- foreach(curK=K.range, .combine = rbind.data.frame,
+                          .packages = c("stm","splines")) %dopar% {
+  
+  set.seed(unique.rand.seed)
+  stm.res.curK <- stm::searchK(documents = out.docs$documents, vocab = out.docs$vocab, 
+                               data = out.docs$meta, prevalence = prevalence.modelspec, 
+                               K = c(curK), N = floor(holdout.perc * length(out.docs$documents)),
+                               proportion = holdout.perc, init.type = "Spectral", max.em.its=75,
+                               seed = unique.rand.seed, M = 10)
+  stm.res.curK$results
+}
+
+tictoc::toc()
+
+# De-register parallel processing cluster
+stopCluster(clus.cores)
+registerDoSEQ()
+
+plot(search.stm.res)
+plot(search.stm.res$exclus,search.stm.res$semcoh,
+     xlab = "Exclusivity", ylab = "Semantic coherence", main = "Model selection for K")
+text(search.stm.res$exclus,search.stm.res$semcoh,
+     labels = search.stm.res$K,pos=1)
+lines(search.stm.res$exclus,search.stm.res$semcoh,lty=4)
+
+# Select the best K by creating a score from the normalized weighted average of both 
+# semantic coherence and exclusivity, according to a pre-specified preference. 
+# The K with the highest score will be the most informative # of topics and 
+# thus the model will be re-estimated on the full dataset with the selected K
+pref.exclus <- 0.40
+
+Kscore.df <- cbind.data.frame(K = unlist(search.stm.res$K),
+                              exclus = unlist(search.stm.res$exclus),
+                              semcoh = unlist(search.stm.res$semcoh)) %>% 
+             mutate(score = (pref.exclus * scale(exclus, center = TRUE, scale = TRUE) + 
+                            (1-pref.exclus) * scale(semcoh,center = TRUE, scale = TRUE)))    
+best.K <- Kscore.df[which.max(Kscore.df$score),"K"]
+
+best.stm <- stm(documents = out.docs$documents, vocab = out.docs$vocab,  data = out.docs$meta,
+                prevalence = prevalence.modelspec, K = best.K, init.type = "Spectral", 
+                max.em.its=75, seed = unique.rand.seed)
+summary(best.stm)
+
+plot(best.stm, type = "summary", xlim = c(0,0.3), cex = 0.7)
+
+dev.off()
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r stm_postestimation, echo=FALSE}
+
+mfx.prevalence.modelspec <- 1:best.K ~ PY + splines::bs(TC) + 
+                                       SJCC.Group1 + SJCC.Group2 + 
+                                       SJCC.Group3 + SJCC.Group4 +
+                                       SJCC.Group5 + Basin.Group.B
+partial.effects <- estimateEffect(formula = mfx.prevalence.modelspec,
+                                  stmobj = best.stm, metadata = out.docs$meta, 
+                                  uncertainty = "Global")
+summary(partial.effects)
+
+pdf("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\Topics.visualize.pdf")
+# Plotting topic content (top documents & word cloud)
+AB.sum <- paste(substr(M.paperdb$AB,1,nchar(M.paperdb$AB_preprocessed)*0.20),"...")
+for (i in 1:best.K) {
+  th.top.i <- findThoughts(best.stm, texts = AB.sum, topics = i, n = 2)$docs[[1]]
+  par(mfrow = c(1, 2),mar = c(.5, .5, 1, .5))
+  plotQuote(th.top.i, width = 35, main = paste("Topic",i))
+  cloud(best.stm, topic = i, max.words = 30)
+}
+dev.off()
+
+# Obtain mfx. type plots for all topics for all continous variables
+pdf("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\mfx.cont.Topics.pdf")
+for (i in 1:best.K) {
+  par(mfrow = c(2, 1))
+  plot(partial.effects, covariate = "PY", method = "continuous", 
+       topics = i,main = "PY")
+  plot(partial.effects, covariate = "TC", method = "continuous", 
+       topics = i,main = "TC")
+}
+dev.off()
+
+# Plot topic distributions across groupings of ASJC classifications
+pdf("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\mfx.Basin.Group.pdf")
+par(mfrow = c(1, 1),mar = c(5, 2, 3, 2))
+plot(partial.effects, method = "difference",
+     covariate = "Basin.Group.B", 
+     cov.value1 = c("Guayas"),
+     cov.value2 = c("All_Others","Biobio","Lerma","Magdalena"),
+     topics =1:best.K, main = "Topic distrib.:  Guayas River Basin (GRB)", 
+     labeltype = "custom", custom.labels = paste0("Topic ", 1:best.K),
+     xlab = "GRB  vs. Other basins", cex = 0.1)
+plot(partial.effects, method = "difference",
+     covariate = "Basin.Group.B", 
+     cov.value1 = c("Biobio"),
+     cov.value2 = c("All_Others","Guayas","Lerma","Magdalena"),
+     topics =1:best.K, main = "Topic distrib.:  Biobio River Basin (BRB)", 
+     labeltype = "custom", custom.labels = paste0("Topic ", 1:best.K),
+     xlab = "BRB  vs. Other basins", cex = 0.1)
+plot(partial.effects, method = "difference",
+     covariate = "Basin.Group.B", 
+     cov.value1 = c("Lerma"),
+     cov.value2 = c("All_Others","Guayas","Biobio","Magdalena"),
+     topics =1:best.K, main = "Topic distrib.:  Lerma River Basin (LRB)", 
+     labeltype = "custom", custom.labels = paste0("Topic ", 1:best.K),
+     xlab = "LRB  vs. Other basins", cex = 0.1)
+plot(partial.effects, method = "difference",
+     covariate = "Basin.Group.B", 
+     cov.value1 = c("Magdalena"),
+     cov.value2 = c("All_Others","Guayas","Biobio","Lerma"),
+     topics =1:best.K, main = "Topic distrib.:  Magdalena River Basin (MRB)", 
+     labeltype = "custom", custom.labels = paste0("Topic ", 1:best.K),
+     xlab = "MRB  vs. Other basins", cex = 0.1)
+dev.off()
+
+pdf("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\SJCC.Groups.pdf")
+par(mfrow = c(1, 1),mar = c(5, 2, 3, 2))
+plot(partial.effects, method = "difference",
+     covariate = "SJCC.Group1", 
+     cov.value1 = c("TRUE"),
+     cov.value2 = c("FALSE"),
+     topics =1:best.K, main = "Topic distrib.:  Agricultural & Bilogical Sciences (ABS)", 
+     labeltype = "custom", custom.labels = paste0("Topic ", 1:best.K),
+     xlab = "ABS  vs. Other domains", cex = 0.1)
+plot(partial.effects, method = "difference",
+     covariate = "SJCC.Group2", 
+     cov.value1 = c("TRUE"),
+     cov.value2 = c("FALSE"),
+     topics =1:best.K, main = "Topic distrib.:  General Decision Siences (GDS)", 
+     labeltype = "custom", custom.labels = paste0("Topic ", 1:best.K),
+     xlab = "GDS  vs. Other domains", cex = 0.1)
+plot(partial.effects, method = "difference",
+     covariate = "SJCC.Group3", 
+     cov.value1 = c("TRUE"),
+     cov.value2 = c("FALSE"),
+     topics =1:best.K, main = "Topic distrib.:  Environmental, Planetary, Physical & Chemical  Sciences (EPPCS)", 
+     labeltype = "custom", custom.labels = paste0("Topic ", 1:best.K),
+     xlab = "EPPCS  vs. Other domains", cex = 0.1)
+plot(partial.effects, method = "difference",
+     covariate = "SJCC.Group4", 
+     cov.value1 = c("TRUE"),
+     cov.value2 = c("FALSE"),
+     topics =1:best.K, main = "Topic distrib.:  General Engineering (GEN)", 
+     labeltype = "custom", custom.labels = paste0("Topic ", 1:best.K),
+     xlab = "GEN  vs. Other domains", cex = 0.1)
+dev.off()
+
+# Estimate and plot topic correlations
+best.stm.topic.corr <- topicCorr(best.stm, method = "huge",
+                                 verbose = TRUE)
+pdf("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\best.stm.topic.corr.pdf")
+plot(best.stm.topic.corr)
+dev.off()
+
+```
+
+
+```{r network_analysis, echo=FALSE}
+
+# Spectral clustering based on adjencency matrix that can be 
+# normalized by either "jaccard" or "cosine" distance metric
+spectral.clustering <- function(A, k, norm = "jaccard") {
+  
+  if (norm=="jaccard") {
+    j.A <- sim2(A,t(A),method = "jaccard", norm = "none")  
+  } else {
+    j.A <- sim2(A,t(A),method = "cosine", norm = "l2")
+  }
+  negRootD <- apply(j.A, 1, sum)^-0.5 # Calculate the diagonal elements of the negative root of  
+  # the degree matrix "D" from the affinity matrix "A"
+  L <- outer(negRootD,negRootD) * A   # Calculate the normalized Laplacian "L" efficiently.
+  # Equivalent to: diag(negRootD) %*% A %*% diag(negRootD) 
+  evL <- eigs_sym(L,k,which="LM")   # Efficiently get the eigenvectors associated to the "k" hihgest eigenvalues
+  # to separate "k" clusters from the data into a reduced space "Z"
+  km <- kmeans(evL$vectors, centers = k) # Run k-means algorithm on "Z" with "k" centers to get cluster
+  # separations for "k" clusters
+  return(km$cluster)
+  
+}
+
+# Construct the matrix representation of the Topic network and compute
+# topic communities based on both Spectral clustering & Hierarchical clustering
+# and plot the best representation
+topic.graph <- graph_from_adjacency_matrix(best.stm.topic.corr$poscor,
+                                           mode = "undirected", weighted = TRUE)
+V(topic.graph)$name <- paste("Topic",1:best.K) 
+
+
+ceb.topic.graph <- cluster_edge_betweenness(topic.graph, directed = FALSE)
+modul.cluster.sol.topic.graph <- list(ceb=modularity(ceb.topic.graph))
+max.cl.num <- floor(vcount(topic.graph)*0.8)
+best.cl <- list(name="",modul=-99,clus.idx=NULL)
+for (g in 2:max.cl.num) {
+  field.name <- paste0("spec.cluster.",g)
+  cl.assign <- spectral.clustering(best.stm.topic.corr$poscor, k=g)
+  set_vertex_attr(topic.graph, name = field.name, value = cl.assign)
+  modul.cluster.sol.topic.graph[[field.name]] <-  modularity(topic.graph, membership = cl.assign,
+                                                             weights = E(topic.graph)$weight)
+  if ( (modul.cluster.sol.topic.graph[[field.name]]-best.cl$modul)/abs(best.cl$modul) > 0.05 ) {
+    # Only consider higher cluster numbers if the increment
+    # over the past best solution exceeds 5%
+    best.cl <- list(name=field.name,modul=modul.cluster.sol.topic.graph[[field.name]],
+                    clus.idx=cl.assign)
+  }
+}
+
+print("Modularity scores for cluster configs.:")
+print(modul.cluster.sol.topic.graph)
+
+cross.ceb.topic <- crossing(ceb.topic.graph, topic.graph)
+print("Crossings:")
+print(cross.ceb.topic)
+
+topic.graph.summary <- list(edge.dens = edge_density(topic.graph, loops = TRUE),
+                            diamet = diameter(topic.graph, directed = FALSE, unconnected = TRUE),
+                            transitiv = transitivity(topic.graph, type="global"),
+                            eig.centre = eigen_centrality(topic.graph,directed = FALSE, scale = TRUE),
+                            centre.betw = centr_betw(topic.graph,directed = FALSE, normalized = TRUE),
+                            hub.score = hub_score(topic.graph, scale = TRUE),
+                            auth.score = authority_score(topic.graph, scale = TRUE),
+                            mean.dist = mean_distance(topic.graph,directed = FALSE, unconnected = TRUE))
+print("Summary stats. for Topic Network:")
+print(topic.graph.summary)
+
+pdf("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\topic.graph.spect.pdf")
+lay.top.plot <- layout_nicely(topic.graph)
+group.members <- lapply( min(best.cl$clus.idx):max(best.cl$clus.idx), 
+		                     function(grp) { which(best.cl$clus.idx == grp) } )
+plot(topic.graph, layout = layout_nicely, mark.groups = group.members,
+     vertex.label = V(topic.graph)$name, vertex.label.cex = 0.4, vertex.color = best.cl$clus.idx,
+     vertex.size = 15, edge.width = 2, edge.curved = TRUE)
+dev.off()
+
+pdf("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\topic.graph.hclust.pdf")
+dendPlot(ceb.topic.graph,mode = "hclust", use.modularity = TRUE)
+plot(ceb.topic.graph, topic.graph, vertex.size = 15, 
+     vertex.label.cex = 0.4, layout = layout_nicely)
+dev.off()
+
+```
+
+```{r save_workspace, echo=FALSE}
+
+save.image("X:\\OneDrive\\Post_PhD_years\\paper_projects\\paper_ariashidalgo_grb\\version_2\\stm_basin_research_v2.RData")
+
+```
